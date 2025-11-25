@@ -16,6 +16,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
 
+import ezpz
 import wandb
 import torch
 
@@ -27,7 +28,9 @@ from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
-print_banner()
+
+logger = ezpz.get_logger(__name__)
+
 
 # -----------------------------------------------------------------------------
 # User settings
@@ -69,12 +72,18 @@ user_config = {k: globals()[k] for k in config_keys} # will be useful for loggin
 # -----------------------------------------------------------------------------
 
 # Compute init
-device_type = autodetect_device_type() if device_type == "" else device_type
+# device_type = autodetect_device_type() if device_type == "" else device_type
+device_type = ezpz.get_torch_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+if ddp_rank == 0:
+    print_banner()
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type in {"cuda", "xpu"} else nullcontext()
+# autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type in {"cuda", "xpu"} else nullcontext()
+synchronize = ezpz.synchronize if device_type in {"cuda", "xpu"} else lambda: None
+get_max_memory = ezpz.utils.get_max_memory_allocated if device_type in {"cuda", "xpu"} else lambda: 0
+# synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+# get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -84,27 +93,31 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
-print0(f"Vocab size: {vocab_size:,}")
+logger.info(f"Vocab size: {vocab_size:,}")
 
 # Model kwargs are derived from the desired depth of the model
 num_layers = depth
 model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
 num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
-print0(f"num_layers: {num_layers}")
-print0(f"model_dim: {model_dim}")
-print0(f"num_heads: {num_heads}")
-print0(f"num_kv_heads: {num_kv_heads}")
+logger.info(f"num_layers={num_layers}")
+logger.info(f"model_dim={model_dim}")
+logger.info(f"num_heads={num_heads}")
+logger.info(f"num_kv_heads={num_kv_heads}")
 
 # Optimizer / data / training length related hyperparameters
 # figure out the needed gradient accumulation to reach the desired total batch size
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
+logger.info(f"{total_batch_size=}")
+logger.info(f"{world_tokens_per_fwdbwd=}")
+assert total_batch_size % world_tokens_per_fwdbwd == 0, (
+    ezpz.breakpoint(0)
+)
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+logger.info(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
+logger.info(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+logger.info(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -123,7 +136,7 @@ output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {resume_from_step}")
+    logger.info(f"Resuming optimization from step {resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -131,29 +144,29 @@ if resuming:
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
-print0(f"Number of parameters: {num_params:,}")
+logger.info(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+logger.info(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
 if num_iterations > 0:
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
+    logger.info(f"Using user-provided number of iterations: {num_iterations:,}")
 elif target_flops > 0:
     # calculate the number of iterations from the target flops
     num_iterations = round(target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+    logger.info(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif target_param_data_ratio > 0:
     # calculate the number of iterations from the target param data ratio
     target_tokens = target_param_data_ratio * num_params
     num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+    logger.info(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
 total_tokens = total_batch_size * num_iterations
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+logger.info(f"Total number of training tokens: {total_tokens:,}")
+logger.info(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
+logger.info(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
@@ -222,7 +235,7 @@ while True:
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
+        logger.info(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
@@ -240,7 +253,7 @@ while True:
         model.eval()
         with autocast_ctx:
             results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        logger.info(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
@@ -267,17 +280,20 @@ while True:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+            logger.info(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != resume_from_step and save_every > 0 and step % save_every == 0):
+        if ezpz.get_rank() == 0:
+            from pathlib import Path
+            Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            [opt.state_dict() for opt in optimizers], # optimizer states
-            { # metadata saved as json
+            checkpoint_dir=checkpoint_dir,
+            step=step,
+            model_data=orig_model.state_dict(), # model parameters
+            optimizer_data=[opt.state_dict() for opt in optimizers], # optimizer states
+            meta_data={ # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
@@ -343,8 +359,11 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
+    logger.info(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    if step % 10 == 0:
+        # logger.info(f"Peak memory usage: {get_max_memory(device=ezpz.get_torch_device_type()) / 1024 / 1024:.2f}MiB")
+        # logger.info(f"Total training time: {total_training_time/60:.2f}m")
+        # logger.info(f"Minimum validation bpb: {min_val_bpb:.4f}")
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -363,9 +382,9 @@ while True:
     step += 1
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
-print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+logger.info(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+logger.info(f"Total training time: {total_training_time/60:.2f}m")
+logger.info(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
 # Log to report
 from nanochat.report import get_report
