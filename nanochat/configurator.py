@@ -14,12 +14,13 @@ complexity and having to prepend config. to every single variable. If someone
 comes up with a better simple Python solution I am all ears.
 """
 
-import os
+import ezpz
 import sys
 from ast import literal_eval
 
 def print0(s="",**kwargs):
-    ddp_rank = int(os.environ.get('RANK', 0))
+    # ddp_rank = int(os.environ.get('RANK', 0))
+    ddp_rank = ezpz.get_rank()
     if ddp_rank == 0:
         print(s, **kwargs)
 
