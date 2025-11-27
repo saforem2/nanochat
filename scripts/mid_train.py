@@ -79,7 +79,12 @@ autocast_ctx = (
 )
 # synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 synchronize = ezpz.synchronize
-get_max_memory = ezpz.g
+if torch.xpu.is_available() and device_type == "xpu":
+    get_max_memory = torch.xpu.max_memory_allocated
+elif torch.cuda.is_available() and device_type == "cuda":
+    get_max_memory = torch.cuda.max_memory_allocated
+else:
+    get_max_memory = lambda: 0
 # get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
 # wandb logging init
