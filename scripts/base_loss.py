@@ -7,6 +7,7 @@ Example run as:
 torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
 """
 
+import ezpz
 import os
 from contextlib import nullcontext
 import torch
@@ -15,7 +16,7 @@ from nanochat.common import (
     compute_init,
     print0,
     compute_cleanup,
-    autodetect_device_type,
+    # autodetect_device_type,
 )
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.tokenizer import get_token_bytes
@@ -33,7 +34,7 @@ exec(
 )  # overrides from command line or config file
 
 # Load the base model and the tokenizer
-device_type = autodetect_device_type() if device_type == "" else device_type
+device_type = ezpz.get_torch_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 model, tokenizer, meta = load_model(
     "base", device, phase="eval", model_tag=model_tag, step=model_step
