@@ -210,7 +210,7 @@ def compute_init(device_type="cuda"):  # cuda|cpu|mps
     #     dist.barrier()
     # else:
     #     device = torch.device(device_type)  # mps|cpu
-    device = ezpz.get_torch_device()
+    device = ezpz.dist.get_torch_device(device_type=device_type, as_torch_device=True)
 
     if rank == 0:
         logger.info(f"Distributed world size: {ezpz.get_world_size()}")
